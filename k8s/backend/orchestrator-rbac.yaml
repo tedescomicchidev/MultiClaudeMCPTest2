@@ -1,0 +1,46 @@
+# ServiceAccount for the orchestrator to interact with the Kubernetes API
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: orchestrator
+  namespace: backend
+  labels:
+    app: orchestrator
+---
+# Role granting permissions to manage Jobs and read Pods/logs in the backend namespace
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: orchestrator-role
+  namespace: backend
+  labels:
+    app: orchestrator
+rules:
+  # Manage Jobs (create, list, get, delete)
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  # Read Pods and their logs (for result collection)
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+---
+# Bind the role to the orchestrator service account
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: orchestrator-rolebinding
+  namespace: backend
+  labels:
+    app: orchestrator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: orchestrator-role
+subjects:
+  - kind: ServiceAccount
+    name: orchestrator
+    namespace: backend
