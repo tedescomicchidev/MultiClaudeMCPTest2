@@ -1,0 +1,38 @@
+# Persistent storage for agent git worktrees.
+#
+# The host directory ~/code/claude-storage is mounted into minikube at
+# /mnt/claude-output via `minikube mount`.  A hostPath PV exposes it to
+# the cluster and the PVC is shared by the orchestrator and worker pods.
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: claude-output-pv
+  labels:
+    type: local
+    app.kubernetes.io/part-of: multi-agent-claude
+spec:
+  capacity:
+    storage: 10Gi
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: manual
+  hostPath:
+    path: /mnt/claude-output
+    type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: claude-output-pvc
+  namespace: backend
+  labels:
+    app.kubernetes.io/part-of: multi-agent-claude
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: manual
+  resources:
+    requests:
+      storage: 10Gi

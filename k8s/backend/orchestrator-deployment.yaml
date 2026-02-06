@@ -26,6 +26,9 @@ spec:
           env:
             - name: MCP_WORKER_IMAGE
               value: "mcp-worker:latest"
+          volumeMounts:
+            - name: claude-output
+              mountPath: /mnt/claude-output
           resources:
             requests:
               memory: "256Mi"
@@ -49,3 +52,7 @@ spec:
             runAsNonRoot: true
             runAsUser: 1000
             allowPrivilegeEscalation: false
+      volumes:
+        - name: claude-output
+          persistentVolumeClaim:
+            claimName: claude-output-pvc

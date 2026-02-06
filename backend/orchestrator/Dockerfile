@@ -1,6 +1,10 @@
 FROM python:3.12-slim
 
-RUN useradd -m -s /bin/bash orchestrator
+# Git is required for creating repos and worktrees
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd -m -u 1000 -s /bin/bash orchestrator
 
 WORKDIR /app
 

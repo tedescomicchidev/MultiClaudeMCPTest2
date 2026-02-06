@@ -1,10 +1,15 @@
+import logging
 import os
+import subprocess
 import uuid
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from kubernetes import client, config
 from pydantic import BaseModel
+
+logger = logging.getLogger("orchestrator")
+logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(title="Multi-Agent Orchestrator")
 
@@ -26,12 +31,82 @@ core_v1 = client.CoreV1Api()
 
 MCP_WORKER_IMAGE = os.environ.get("MCP_WORKER_IMAGE", "mcp-worker:latest")
 NAMESPACE = "backend"
+OUTPUT_BASE = "/mnt/claude-output"
 
 
 class RunRequest(BaseModel):
     prompt: str
     num_agents: int = 1
 
+
+# ---------------------------------------------------------------------------
+# Git helpers
+# ---------------------------------------------------------------------------
+
+def _run_git(args: list[str], cwd: str | None = None) -> str:
+    """Run a git command and return stdout."""
+    result = subprocess.run(
+        ["git"] + args,
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout.strip()
+
+
+def setup_run_repo(group_id: str, num_agents: int) -> list[dict]:
+    """Create a run directory, init a git repo, and create one worktree per agent.
+
+    Directory layout:
+        /mnt/claude-output/run-<group_id>/
+            repo/              <- main git repository
+            agent-0/           <- worktree on branch agent-0
+            agent-1/           <- worktree on branch agent-1
+            ...
+
+    Returns a list of dicts with agent_id, branch, and worktree_path.
+    """
+    run_dir = os.path.join(OUTPUT_BASE, f"run-{group_id}")
+    repo_dir = os.path.join(run_dir, "repo")
+    os.makedirs(repo_dir, exist_ok=True)
+
+    # 1. Init the repository
+    _run_git(["init"], cwd=repo_dir)
+    _run_git(["config", "user.email", "agent@claude.local"], cwd=repo_dir)
+    _run_git(["config", "user.name", "Claude Agent"], cwd=repo_dir)
+
+    # 2. Create an initial commit so branches can be created
+    readme_path = os.path.join(repo_dir, "README.md")
+    with open(readme_path, "w") as f:
+        f.write(f"# Run {group_id}\n\nMulti-agent Claude MCP run.\n")
+    _run_git(["add", "."], cwd=repo_dir)
+    _run_git(["commit", "-m", "Initial commit"], cwd=repo_dir)
+
+    # 3. Create a worktree + branch per agent
+    worktrees: list[dict] = []
+    for i in range(num_agents):
+        branch_name = f"agent-{i}"
+        worktree_path = os.path.join(run_dir, f"agent-{i}")
+        _run_git(
+            ["worktree", "add", "-b", branch_name, worktree_path],
+            cwd=repo_dir,
+        )
+        logger.info("Created worktree %s on branch %s", worktree_path, branch_name)
+        worktrees.append(
+            {
+                "agent_id": i,
+                "branch": branch_name,
+                "worktree_path": worktree_path,
+            }
+        )
+
+    return worktrees
+
+
+# ---------------------------------------------------------------------------
+# API endpoints
+# ---------------------------------------------------------------------------
 
 @app.post("/api/run")
 async def run_agents(req: RunRequest):
@@ -43,11 +118,29 @@ async def run_agents(req: RunRequest):
         )
 
     job_group_id = uuid.uuid4().hex[:8]
-    job_names = []
 
-    for i in range(req.num_agents):
-        job_name = f"mcp-worker-{job_group_id}-{i}"
-        job = _build_job(job_name, req.prompt, i, job_group_id)
+    # --- 1. Create run folder, init git repo, create worktrees ---
+    try:
+        worktrees = setup_run_repo(job_group_id, req.num_agents)
+    except subprocess.CalledProcessError as exc:
+        logger.error("Git setup failed: %s\nstderr: %s", exc, exc.stderr)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to set up git worktrees: {exc.stderr}",
+        )
+
+    # --- 2. Launch one K8s Job per agent, passing worktree info ---
+    job_names = []
+    for wt in worktrees:
+        job_name = f"mcp-worker-{job_group_id}-{wt['agent_id']}"
+        job = _build_job(
+            name=job_name,
+            prompt=req.prompt,
+            agent_id=wt["agent_id"],
+            group_id=job_group_id,
+            branch=wt["branch"],
+            worktree_path=wt["worktree_path"],
+        )
         batch_v1.create_namespaced_job(namespace=NAMESPACE, body=job)
         job_names.append(job_name)
 
@@ -117,9 +210,24 @@ async def healthz():
     return {"status": "ok"}
 
 
+# ---------------------------------------------------------------------------
+# K8s Job builder
+# ---------------------------------------------------------------------------
+
 def _build_job(
-    name: str, prompt: str, agent_id: int, group_id: str
+    name: str,
+    prompt: str,
+    agent_id: int,
+    group_id: str,
+    branch: str,
+    worktree_path: str,
 ) -> client.V1Job:
+    """Build a K8s Job spec for an MCP worker.
+
+    The worker receives the worktree path and branch via env vars so it can:
+    - use the worktree as its working directory
+    - commit all changes to the assigned branch when done
+    """
     container = client.V1Container(
         name="mcp-worker",
         image=MCP_WORKER_IMAGE,
@@ -128,6 +236,8 @@ def _build_job(
             client.V1EnvVar(name="AGENT_PROMPT", value=prompt),
             client.V1EnvVar(name="AGENT_ID", value=str(agent_id)),
             client.V1EnvVar(name="JOB_GROUP_ID", value=group_id),
+            client.V1EnvVar(name="AGENT_BRANCH", value=branch),
+            client.V1EnvVar(name="AGENT_WORKTREE_PATH", value=worktree_path),
             client.V1EnvVar(
                 name="ANTHROPIC_API_KEY",
                 value_from=client.V1EnvVarSource(
@@ -136,6 +246,12 @@ def _build_job(
                     )
                 ),
             ),
+        ],
+        volume_mounts=[
+            client.V1VolumeMount(
+                name="claude-output",
+                mount_path=OUTPUT_BASE,
+            )
         ],
         resources=client.V1ResourceRequirements(
             requests={"memory": "1Gi", "cpu": "1"},
@@ -155,6 +271,14 @@ def _build_job(
         spec=client.V1PodSpec(
             containers=[container],
             restart_policy="Never",
+            volumes=[
+                client.V1Volume(
+                    name="claude-output",
+                    persistent_volume_claim=client.V1PersistentVolumeClaimVolumeSource(
+                        claim_name="claude-output-pvc",
+                    ),
+                )
+            ],
         ),
     )
 
