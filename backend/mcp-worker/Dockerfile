@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-pip \
     python3-venv \
     git \
+    jq \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Claude Code CLI globally
@@ -23,7 +24,9 @@ RUN npm install -g @anthropic-ai/claude-code
 RUN useradd -m -s /bin/bash agent && \
     mkdir -p /home/agent/workspace && \
     mkdir -p /home/agent/.claude && \
-    chown -R agent:agent /home/agent
+    mkdir -p /app && \
+    chown -R agent:agent /home/agent && \
+    chown -R agent:agent /app
 
 USER agent
 WORKDIR /home/agent/workspace
@@ -35,6 +38,11 @@ ENV PATH="/home/agent/venv/bin:$PATH"
 COPY --chown=agent:agent requirements.txt /home/agent/
 RUN pip install --no-cache-dir -r /home/agent/requirements.txt
 
+# Copy the worker script to /app for consistent path references in hooks
+COPY --chown=agent:agent worker.py /app/worker.py
 COPY --chown=agent:agent worker.py /home/agent/
+
+# Copy Claude Code hooks configuration
+COPY --chown=agent:agent .claude/ /home/agent/.claude/
 
 CMD ["python3", "/home/agent/worker.py"]
