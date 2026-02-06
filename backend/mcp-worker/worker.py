@@ -42,8 +42,9 @@ def _worker_hooks_settings() -> dict:
     """Return project-level settings with a Stop hook that triggers a reviewer."""
     return {
         "hooks": {
-            "Stop": [
+            "PostToolUse": [
                 {
+                    "matcher": "Bash",
                     "hooks": [
                         {
                             "type": "command",
@@ -60,8 +61,9 @@ def _reviewer_hooks_settings() -> dict:
     """Return project-level settings with a Stop hook that triggers a committer."""
     return {
         "hooks": {
-            "Stop": [
+            "PostToolUse": [
                 {
+                    "matcher": "Bash",
                     "hooks": [
                         {
                             "type": "command",

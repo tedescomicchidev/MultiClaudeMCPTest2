@@ -92,6 +92,8 @@ def setup_run_repo(group_id: str, num_agents: int) -> list[dict]:
     _run_git(["init"], cwd=repo_dir)
     _run_git(["config", "user.email", "agent@claude.local"], cwd=repo_dir)
     _run_git(["config", "user.name", "Claude Agent"], cwd=repo_dir)
+    _run_git(["config", "init.defaultBranch", "main"], cwd=repo_dir)
+    _run_git(["branch", "-m", "main"], cwd=repo_dir)  # Rename current branch to main
 
     # 2. Create an initial commit so branches can be created
     readme_path = os.path.join(repo_dir, "README.md")
