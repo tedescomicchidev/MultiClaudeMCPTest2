@@ -34,9 +34,26 @@ NAMESPACE = "backend"
 OUTPUT_BASE = "/mnt/claude-output"
 
 
+# ---------------------------------------------------------------------------
+# Request models
+# ---------------------------------------------------------------------------
+
 class RunRequest(BaseModel):
     prompt: str
     num_agents: int = 1
+
+
+class StartReviewerRequest(BaseModel):
+    worktree_path: str
+    branch: str
+    group_id: str
+    agent_id: str
+
+
+class StartCommitterRequest(BaseModel):
+    worktree_path: str
+    branch: str
+    group_id: str
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +121,14 @@ def setup_run_repo(group_id: str, num_agents: int) -> list[dict]:
     return worktrees
 
 
+def _repo_dir_from_worktree(worktree_path: str) -> str:
+    """Derive the main repo directory from a worktree path.
+
+    Convention: /mnt/claude-output/run-<id>/agent-N  ->  .../run-<id>/repo
+    """
+    return os.path.join(os.path.dirname(worktree_path), "repo")
+
+
 # ---------------------------------------------------------------------------
 # API endpoints
 # ---------------------------------------------------------------------------
@@ -136,15 +161,57 @@ async def run_agents(req: RunRequest):
         job = _build_job(
             name=job_name,
             prompt=req.prompt,
-            agent_id=wt["agent_id"],
+            agent_id=str(wt["agent_id"]),
             group_id=job_group_id,
             branch=wt["branch"],
             worktree_path=wt["worktree_path"],
+            role="worker",
         )
         batch_v1.create_namespaced_job(namespace=NAMESPACE, body=job)
         job_names.append(job_name)
 
     return {"job_group_id": job_group_id, "jobs": job_names}
+
+
+@app.post("/api/start-reviewer")
+async def start_reviewer(req: StartReviewerRequest):
+    """Called by the worker's Stop hook to spawn a reviewer agent."""
+    job_name = f"reviewer-{req.group_id}-{req.agent_id}"
+    logger.info("Starting reviewer: %s for branch %s", job_name, req.branch)
+
+    job = _build_job(
+        name=job_name,
+        prompt="",  # reviewer builds its own prompt
+        agent_id=req.agent_id,
+        group_id=req.group_id,
+        branch=req.branch,
+        worktree_path=req.worktree_path,
+        role="reviewer",
+    )
+    batch_v1.create_namespaced_job(namespace=NAMESPACE, body=job)
+    return {"job": job_name, "role": "reviewer"}
+
+
+@app.post("/api/start-committer")
+async def start_committer(req: StartCommitterRequest):
+    """Called by the reviewer's Stop hook to spawn a committer agent."""
+    job_name = f"committer-{req.group_id}-{req.branch}"
+    logger.info("Starting committer: %s for branch %s", job_name, req.branch)
+
+    repo_dir = _repo_dir_from_worktree(req.worktree_path)
+
+    job = _build_job(
+        name=job_name,
+        prompt="",  # committer builds its own prompt
+        agent_id="0",
+        group_id=req.group_id,
+        branch=req.branch,
+        worktree_path=req.worktree_path,
+        role="committer",
+        repo_dir=repo_dir,
+    )
+    batch_v1.create_namespaced_job(namespace=NAMESPACE, body=job)
+    return {"job": job_name, "role": "committer"}
 
 
 @app.get("/api/status/{job_group_id}")
@@ -217,36 +284,37 @@ async def healthz():
 def _build_job(
     name: str,
     prompt: str,
-    agent_id: int,
+    agent_id: str,
     group_id: str,
     branch: str,
     worktree_path: str,
+    role: str = "worker",
+    repo_dir: str = "",
 ) -> client.V1Job:
-    """Build a K8s Job spec for an MCP worker.
+    """Build a K8s Job spec for an MCP worker / reviewer / committer."""
+    env_vars = [
+        client.V1EnvVar(name="AGENT_PROMPT", value=prompt),
+        client.V1EnvVar(name="AGENT_ID", value=str(agent_id)),
+        client.V1EnvVar(name="JOB_GROUP_ID", value=group_id),
+        client.V1EnvVar(name="AGENT_BRANCH", value=branch),
+        client.V1EnvVar(name="AGENT_WORKTREE_PATH", value=worktree_path),
+        client.V1EnvVar(name="AGENT_ROLE", value=role),
+        client.V1EnvVar(name="REPO_DIR", value=repo_dir),
+        client.V1EnvVar(
+            name="ANTHROPIC_API_KEY",
+            value_from=client.V1EnvVarSource(
+                secret_key_ref=client.V1SecretKeySelector(
+                    name="anthropic-api-key", key="api-key"
+                )
+            ),
+        ),
+    ]
 
-    The worker receives the worktree path and branch via env vars so it can:
-    - use the worktree as its working directory
-    - commit all changes to the assigned branch when done
-    """
     container = client.V1Container(
         name="mcp-worker",
         image=MCP_WORKER_IMAGE,
         image_pull_policy="IfNotPresent",
-        env=[
-            client.V1EnvVar(name="AGENT_PROMPT", value=prompt),
-            client.V1EnvVar(name="AGENT_ID", value=str(agent_id)),
-            client.V1EnvVar(name="JOB_GROUP_ID", value=group_id),
-            client.V1EnvVar(name="AGENT_BRANCH", value=branch),
-            client.V1EnvVar(name="AGENT_WORKTREE_PATH", value=worktree_path),
-            client.V1EnvVar(
-                name="ANTHROPIC_API_KEY",
-                value_from=client.V1EnvVarSource(
-                    secret_key_ref=client.V1SecretKeySelector(
-                        name="anthropic-api-key", key="api-key"
-                    )
-                ),
-            ),
-        ],
+        env=env_vars,
         volume_mounts=[
             client.V1VolumeMount(
                 name="claude-output",
@@ -266,7 +334,11 @@ def _build_job(
 
     template = client.V1PodTemplateSpec(
         metadata=client.V1ObjectMeta(
-            labels={"app": "mcp-worker", "job-group": group_id}
+            labels={
+                "app": "mcp-worker",
+                "job-group": group_id,
+                "role": role,
+            }
         ),
         spec=client.V1PodSpec(
             containers=[container],
@@ -294,7 +366,11 @@ def _build_job(
         metadata=client.V1ObjectMeta(
             name=name,
             namespace=NAMESPACE,
-            labels={"app": "mcp-worker", "job-group": group_id},
+            labels={
+                "app": "mcp-worker",
+                "job-group": group_id,
+                "role": role,
+            },
         ),
         spec=spec,
     )

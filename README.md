@@ -1,6 +1,6 @@
 # Multi-Agent Claude MCP
 
-A Kubernetes-based multi-agent system that orchestrates multiple Claude Code MCP instances. Users submit prompts via a web frontend, select the number of agents, and each agent processes the prompt independently in its own git worktree. Results are committed to per-agent branches and synced back to the host.
+A Kubernetes-based multi-agent system that orchestrates multiple Claude Code MCP instances. Users submit prompts via a web frontend, select the number of agents, and each agent processes the prompt independently in its own git worktree. After each agent finishes, an automated **review-then-merge** pipeline runs via Claude Code hooks.
 
 ## Architecture
 
@@ -25,14 +25,24 @@ A Kubernetes-based multi-agent system that orchestrates multiple Claude Code MCP
 │ │                  │     │        │ 3. create K8s Jobs      │   │
 │ │                  │     │        ▼                         │   │
 │ │                  │     │ ┌────────────┐ ┌────────────┐   │   │
-│ │                  │     │ │ MCP Worker │ │ MCP Worker │   │   │
-│ │                  │     │ │ (Job)      │ │ (Job)      │   │   │
-│ │                  │     │ │            │ │            │   │   │
-│ │                  │     │ │ branch:    │ │ branch:    │   │   │
+│ │                  │     │ │  WORKER    │ │  WORKER    │   │   │
 │ │                  │     │ │  agent-0   │ │  agent-1   │   │   │
-│ │                  │     │ │ cwd:       │ │ cwd:       │   │   │
-│ │                  │     │ │  worktree  │ │  worktree  │   │   │
-│ │                  │     │ │ -> commit  │ │ -> commit  │   │   │
+│ │                  │     │ │  -> commit │ │  -> commit │   │   │
+│ │                  │     │ └─────┬──────┘ └─────┬──────┘   │   │
+│ │                  │     │       │ Stop hook     │          │   │
+│ │                  │     │       ▼               ▼          │   │
+│ │                  │     │ ┌────────────┐ ┌────────────┐   │   │
+│ │                  │     │ │  REVIEWER  │ │  REVIEWER  │   │   │
+│ │                  │     │ │  agent-0   │ │  agent-1   │   │   │
+│ │                  │     │ │  -> review │ │  -> review │   │   │
+│ │                  │     │ │  -> commit │ │  -> commit │   │   │
+│ │                  │     │ └─────┬──────┘ └─────┬──────┘   │   │
+│ │                  │     │       │ Stop hook     │          │   │
+│ │                  │     │       ▼               ▼          │   │
+│ │                  │     │ ┌────────────┐ ┌────────────┐   │   │
+│ │                  │     │ │  COMMITTER │ │  COMMITTER │   │   │
+│ │                  │     │ │  agent-0   │ │  agent-1   │   │   │
+│ │                  │     │ │  -> merge  │ │  -> merge  │   │   │
 │ │                  │     │ └────────────┘ └────────────┘   │   │
 │ └──────────────────┘     └──────────────────────────────────┘   │
 └──────────────────────────────────────────────────────────────────┘
@@ -41,12 +51,24 @@ A Kubernetes-based multi-agent system that orchestrates multiple Claude Code MCP
 ### Components
 
 - **Frontend** (namespace: `frontend`): Flask web app where users enter prompts and select agent count
-- **Orchestrator** (namespace: `backend`): FastAPI app with 2 load-balanced replicas. On each run it:
-  1. Creates a run directory under `/mnt/claude-output`
-  2. Initialises a git repo with an initial commit
-  3. Creates one git worktree + branch per agent
-  4. Launches one K8s Job per agent, passing the worktree path and branch name
-- **MCP Worker** (namespace: `backend`): One K8s Job per agent. Each pod runs `claude mcp serve` (STDIO MCP) via the Claude Agent SDK, uses its assigned worktree as `cwd`, and commits all changes to its branch as the final step.
+- **Orchestrator** (namespace: `backend`): FastAPI app with 2 load-balanced replicas. On each run it creates a git repo, worktrees, and launches worker Jobs. Also exposes `/api/start-reviewer` and `/api/start-committer` endpoints called by hooks.
+- **MCP Worker** (namespace: `backend`): Reusable container image with three roles:
+
+| Role | Trigger | What it does | Hook |
+|------|---------|-------------|------|
+| **worker** | Orchestrator `/api/run` | Executes the user's prompt, commits to `agent-N` branch | `Stop` hook calls `/api/start-reviewer` |
+| **reviewer** | Worker's Stop hook | Reviews commits, creates `review-details.md`, commits fixes | `Stop` hook calls `/api/start-committer` (if `review-details.md` was committed) |
+| **committer** | Reviewer's Stop hook | Merges the `agent-N` branch back to `main` | None |
+
+### Hook Pipeline
+
+The pipeline is driven by Claude Code **Stop hooks** configured via `.claude/settings.json` in each agent's working directory:
+
+1. **Worker finishes** → the `on-worker-stop.sh` hook checks if commits exist on the branch → calls `POST /api/start-reviewer`
+2. **Reviewer finishes** → the `on-reviewer-stop.sh` hook checks if `review-details.md` was committed → calls `POST /api/start-committer`
+3. **Committer finishes** → no hook, pipeline complete
+
+Both hooks guard against infinite re-triggering by checking the `stop_hook_active` field from the Stop event input.
 
 ### Storage
 
@@ -59,7 +81,7 @@ Each run creates:
 ```
 ~/code/claude-storage/
   run-<id>/
-    repo/           <- main git repository
+    repo/           <- main git repository (main branch, receives merges)
     agent-0/        <- worktree on branch agent-0
     agent-1/        <- worktree on branch agent-1
     ...
@@ -133,9 +155,12 @@ minikube service frontend -n frontend
 │   │   ├── Dockerfile
 │   │   └── requirements.txt
 │   └── mcp-worker/
-│       ├── worker.py           # Claude Agent SDK + MCP worker
+│       ├── worker.py           # Claude Agent SDK + MCP worker (3 roles)
 │       ├── Dockerfile
-│       └── requirements.txt
+│       ├── requirements.txt
+│       └── hooks/
+│           ├── on-worker-stop.sh    # Stop hook: worker -> reviewer
+│           └── on-reviewer-stop.sh  # Stop hook: reviewer -> committer
 ├── k8s/
 │   ├── namespaces.yaml
 │   ├── secret.yaml             # API key secret template
@@ -155,18 +180,23 @@ minikube service frontend -n frontend
 
 1. User enters a prompt and selects the number of agents in the web UI
 2. The frontend sends a POST request to the orchestrator
-3. The orchestrator:
-   a. Creates `/mnt/claude-output/run-<id>/repo/` and runs `git init`
-   b. Makes an initial commit
-   c. For each agent, runs `git worktree add -b agent-N` to create a worktree and branch
-4. The orchestrator creates one Kubernetes Job per agent, passing:
-   - `AGENT_WORKTREE_PATH` -- the worktree directory as the agent's working directory
-   - `AGENT_BRANCH` -- the branch name for the agent
-5. Each Job pod runs the MCP worker which:
+3. The orchestrator creates `/mnt/claude-output/run-<id>/repo/`, runs `git init`, and creates one worktree per agent
+4. The orchestrator creates one Kubernetes **worker** Job per agent
+5. Each worker:
+   - Writes a `.claude/settings.json` with a `Stop` hook into its worktree
    - Uses the Claude Agent SDK (`query()`) with `claude mcp serve` as a STDIO MCP server
-   - Receives system-prompt instructions to `git add -A && git commit` as the final step
-   - Works in its own worktree so agents never conflict
-6. After all agents finish, each agent's work is on a separate branch visible at `~/code/claude-storage/run-<id>/`
+   - Executes the user's prompt, then `git add -A && git commit`
+   - On stop, the hook detects the commit and calls `/api/start-reviewer`
+6. Each **reviewer**:
+   - Writes a `.claude/settings.json` with a different `Stop` hook
+   - Reviews all commits on the branch (`git diff main`)
+   - Creates `review-details.md` summarising findings and fixes
+   - Commits everything; on stop, the hook detects `review-details.md` and calls `/api/start-committer`
+7. Each **committer**:
+   - Works in the repo directory (on `main`)
+   - Runs `git merge agent-N` to merge the reviewed branch
+   - Resolves any conflicts, verifies with `git log`
+8. Final result: all agent work is reviewed and merged into `main` at `~/code/claude-storage/run-<id>/repo/`
 
 ## Inspecting Results
 
@@ -178,28 +208,36 @@ ls ~/code/claude-storage/
 cd ~/code/claude-storage/run-<id>/repo
 git branch
 
-# View agent-0's diff
-git diff main..agent-0
+# View merged result on main
+git log main --oneline
 
-# View agent-1's log
-git log agent-1 --oneline
+# View agent-0's review
+cat ~/code/claude-storage/run-<id>/agent-0/review-details.md
+
+# View agent-0's full diff before merge
+git diff main..agent-0
 ```
 
 ## Monitoring
 
 ```bash
-# Check pods in all namespaces
-kubectl get pods -n frontend
+# Check all pods (workers, reviewers, committers)
 kubectl get pods -n backend
 
-# Check orchestrator logs
-kubectl logs -n backend -l app=orchestrator
+# Check all jobs with roles
+kubectl get jobs -n backend -L role
 
-# Check MCP worker jobs
-kubectl get jobs -n backend
-
-# Check a specific worker's output
+# Check a worker's output
 kubectl logs -n backend job/mcp-worker-<group-id>-<agent-id>
+
+# Check a reviewer's output
+kubectl logs -n backend job/reviewer-<group-id>-<agent-id>
+
+# Check a committer's output
+kubectl logs -n backend job/committer-<group-id>-<branch>
+
+# Check orchestrator logs (shows hook-triggered job creation)
+kubectl logs -n backend -l app=orchestrator
 ```
 
 ## Platform Support
@@ -218,3 +256,4 @@ kubectl logs -n backend job/mcp-worker-<group-id>-<agent-id>
 - The Anthropic API key is stored as a Kubernetes Secret and injected via env vars
 - MCP worker pods are ephemeral (Jobs with `ttlSecondsAfterFinished: 3600`)
 - Shared storage uses a hostPath PV scoped to `~/code/claude-storage`
+- Stop hooks guard against infinite loops via the `stop_hook_active` field

@@ -8,22 +8,30 @@
 
 FROM node:20-slim
 
-# Install Python and essential tools
+# Install Python, git, curl, and jq
+# curl + jq are needed by the Stop hook scripts to call the orchestrator API
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
     python3-venv \
     git \
+    curl \
+    jq \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Claude Code CLI globally
 RUN npm install -g @anthropic-ai/claude-code
 
-# Create non-root user
-RUN useradd -m -s /bin/bash agent && \
+# Create non-root user (uid 1000 matches the K8s security context)
+RUN useradd -m -u 1000 -s /bin/bash agent && \
     mkdir -p /home/agent/workspace && \
     mkdir -p /home/agent/.claude && \
+    mkdir -p /home/agent/hooks && \
     chown -R agent:agent /home/agent
+
+# Copy hook scripts (must be executable)
+COPY --chown=agent:agent hooks/ /home/agent/hooks/
+RUN chmod +x /home/agent/hooks/*.sh
 
 USER agent
 WORKDIR /home/agent/workspace
