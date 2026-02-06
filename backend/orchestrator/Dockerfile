@@ -2,7 +2,8 @@ FROM python:3.12-slim
 
 # Git is required for creating repos and worktrees
 RUN apt-get update && apt-get install -y --no-install-recommends git \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && git config --global init.defaultBranch main
 
 RUN useradd -m -u 1000 -s /bin/bash orchestrator
 
