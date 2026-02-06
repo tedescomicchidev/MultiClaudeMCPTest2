@@ -151,9 +151,13 @@ open:
 # Clean up resources
 clean:
 	@echo "[INFO]  Cleaning up Kubernetes resources..."
+	@kubectl delete pods -l app=mcp-worker -n backend
 	@kubectl delete -f ./k8s/frontend/ --ignore-not-found=true || true
 	@kubectl delete -f ./k8s/backend/ --ignore-not-found=true || true
 	@kubectl delete -f ./k8s/namespaces.yaml --ignore-not-found=true || true
+	@docker rmi orchestrator:latest
+	@docker rmi frontend:latest
+	@docker rmi mcp-worker:latest
 	@echo "[INFO]  Cleanup complete."
 
 # Stop minikube
