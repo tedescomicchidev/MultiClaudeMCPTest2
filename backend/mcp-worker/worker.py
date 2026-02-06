@@ -1,8 +1,15 @@
 """MCP Worker: runs a Claude Agent SDK query with 'claude mcp serve' as the STDIO MCP server.
 
-Each worker pod receives a prompt via the AGENT_PROMPT environment variable,
-processes it using the Claude Agent SDK backed by the Claude Code MCP server,
-and outputs the results to stdout (collected via pod logs by the orchestrator).
+Each worker pod receives:
+  - AGENT_PROMPT          : the user's prompt
+  - AGENT_ID              : numeric agent identifier
+  - JOB_GROUP_ID          : run group identifier
+  - AGENT_BRANCH          : git branch assigned to this agent
+  - AGENT_WORKTREE_PATH   : path to the git worktree for this agent
+
+The worker uses the worktree as its working directory and appends
+instructions to the system prompt so the agent commits all changes to
+its assigned branch as the final step.
 """
 
 import asyncio
@@ -19,47 +26,66 @@ from claude_agent_sdk import (
 )
 
 
+def build_commit_instructions(branch: str) -> str:
+    """Return the system-prompt appendix that tells the agent to commit."""
+    return (
+        "\n\n--- GIT WORKFLOW INSTRUCTIONS ---\n"
+        f"You are working inside a git worktree on branch '{branch}'.\n"
+        "Your working directory is already set to this worktree.\n"
+        "IMPORTANT: As your VERY LAST step, after all other work is complete, you MUST:\n"
+        "  1. Run `git add -A` to stage every file you created or changed.\n"
+        f'  2. Run `git commit -m "Agent work: <short summary of what you did>"` '
+        "to commit all changes.\n"
+        "Do NOT push. Do NOT switch branches. Just add and commit.\n"
+        "--- END GIT WORKFLOW INSTRUCTIONS ---\n"
+    )
+
+
 async def main():
     prompt = os.environ.get("AGENT_PROMPT", "")
     agent_id = os.environ.get("AGENT_ID", "0")
     group_id = os.environ.get("JOB_GROUP_ID", "unknown")
+    branch = os.environ.get("AGENT_BRANCH", "")
+    worktree_path = os.environ.get("AGENT_WORKTREE_PATH", "")
 
     if not prompt:
         print("ERROR: No prompt provided via AGENT_PROMPT env var", file=sys.stderr)
         sys.exit(1)
 
+    # Fall back to a generic workspace when no worktree is provided
+    cwd = worktree_path if worktree_path else "/home/agent/workspace"
+
     print(f"[Agent {agent_id}] Starting (group={group_id})")
+    print(f"[Agent {agent_id}] Branch: {branch}")
+    print(f"[Agent {agent_id}] Worktree: {cwd}")
     print(f"[Agent {agent_id}] Prompt: {prompt[:200]}{'...' if len(prompt) > 200 else ''}")
 
+    # Build the system prompt appendix
+    agent_instructions = (
+        f"You are autonomous agent #{agent_id} in a group of agents. "
+        "Complete the given task independently and thoroughly. "
+        "Provide detailed results when finished."
+    )
+    if branch:
+        agent_instructions += build_commit_instructions(branch)
+
     # Configure the Claude Agent SDK with 'claude mcp serve' as an STDIO MCP server.
-    # This exposes Claude Code's built-in tools (Read, Write, Edit, Bash, etc.)
-    # through the MCP protocol, making them available to the agent.
     options = ClaudeAgentOptions(
-        # Use Claude Code's system prompt with additional instructions for this agent
         system_prompt={
             "type": "preset",
             "preset": "claude_code",
-            "append": (
-                f"You are autonomous agent #{agent_id} in a group of agents. "
-                "Complete the given task independently and thoroughly. "
-                "Provide detailed results when finished."
-            ),
+            "append": agent_instructions,
         },
-        # Configure 'claude mcp serve' as the STDIO MCP server
         mcp_servers={
             "claude-code": {
                 "command": "claude",
                 "args": ["mcp", "serve"],
             }
         },
-        # Allow all tools from the MCP server
         allowed_tools=["mcp__claude-code__*"],
-        # Bypass all permission checks for autonomous operation in container
         permission_mode="bypassPermissions",
-        # Limit turns to prevent runaway agents
         max_turns=50,
-        # Set the working directory
-        cwd="/home/agent/workspace",
+        cwd=cwd,
     )
 
     result_text = ""

@@ -1,35 +1,69 @@
 # Multi-Agent Claude MCP
 
-A Kubernetes-based multi-agent system that orchestrates multiple Claude Code MCP instances. Users submit prompts via a web frontend, select the number of agents, and each agent processes the prompt independently in its own container.
+A Kubernetes-based multi-agent system that orchestrates multiple Claude Code MCP instances. Users submit prompts via a web frontend, select the number of agents, and each agent processes the prompt independently in its own git worktree. Results are committed to per-agent branches and synced back to the host.
 
 ## Architecture
 
 ```
-┌──────────────────────┐     ┌──────────────────────────────────────────────┐
-│  frontend namespace  │     │            backend namespace                 │
-│                      │     │                                              │
-│  ┌────────────────┐  │     │  ┌──────────────────┐                       │
-│  │   Flask Web    │──┼─────┼─▶│  Orchestrator    │                       │
-│  │   App (UI)     │  │     │  │  (FastAPI x2)    │                       │
-│  └────────────────┘  │     │  └──────┬───────────┘                       │
-│                      │     │         │ creates K8s Jobs                   │
-│                      │     │         ▼                                    │
-│                      │     │  ┌─────────────┐  ┌─────────────┐           │
-│                      │     │  │ MCP Worker  │  │ MCP Worker  │  ...      │
-│                      │     │  │ Pod (Job)   │  │ Pod (Job)   │           │
-│                      │     │  │             │  │             │           │
-│                      │     │  │ claude mcp  │  │ claude mcp  │           │
-│                      │     │  │   serve     │  │   serve     │           │
-│                      │     │  │ (STDIO MCP) │  │ (STDIO MCP) │           │
-│                      │     │  └─────────────┘  └─────────────┘           │
-└──────────────────────┘     └──────────────────────────────────────────────┘
+  ~/code/claude-storage (host)
+          │  minikube mount
+          ▼
+  /mnt/claude-output (cluster)
+          │
+┌─────────┴────────────────────────────────────────────────────────┐
+│                                                                  │
+│ ┌──────────────────┐     ┌──────────────────────────────────┐   │
+│ │ frontend ns      │     │ backend ns                       │   │
+│ │                  │     │                                  │   │
+│ │ ┌──────────────┐ │     │ ┌──────────────────┐            │   │
+│ │ │  Flask Web   │─┼─────┼▶│  Orchestrator    │            │   │
+│ │ │  App (UI)    │ │     │ │  (FastAPI x2)    │            │   │
+│ │ └──────────────┘ │     │ └──────┬───────────┘            │   │
+│ │                  │     │        │                         │   │
+│ │                  │     │        │ 1. git init repo        │   │
+│ │                  │     │        │ 2. git worktree add     │   │
+│ │                  │     │        │ 3. create K8s Jobs      │   │
+│ │                  │     │        ▼                         │   │
+│ │                  │     │ ┌────────────┐ ┌────────────┐   │   │
+│ │                  │     │ │ MCP Worker │ │ MCP Worker │   │   │
+│ │                  │     │ │ (Job)      │ │ (Job)      │   │   │
+│ │                  │     │ │            │ │            │   │   │
+│ │                  │     │ │ branch:    │ │ branch:    │   │   │
+│ │                  │     │ │  agent-0   │ │  agent-1   │   │   │
+│ │                  │     │ │ cwd:       │ │ cwd:       │   │   │
+│ │                  │     │ │  worktree  │ │  worktree  │   │   │
+│ │                  │     │ │ -> commit  │ │ -> commit  │   │   │
+│ │                  │     │ └────────────┘ └────────────┘   │   │
+│ └──────────────────┘     └──────────────────────────────────┘   │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 ### Components
 
 - **Frontend** (namespace: `frontend`): Flask web app where users enter prompts and select agent count
-- **Orchestrator** (namespace: `backend`): FastAPI app with 2 load-balanced replicas that creates and monitors K8s Jobs
-- **MCP Worker** (namespace: `backend`): One K8s Job per agent. Each pod runs `claude mcp serve` (STDIO MCP) via the Claude Agent SDK. The container terminates after the prompt is processed.
+- **Orchestrator** (namespace: `backend`): FastAPI app with 2 load-balanced replicas. On each run it:
+  1. Creates a run directory under `/mnt/claude-output`
+  2. Initialises a git repo with an initial commit
+  3. Creates one git worktree + branch per agent
+  4. Launches one K8s Job per agent, passing the worktree path and branch name
+- **MCP Worker** (namespace: `backend`): One K8s Job per agent. Each pod runs `claude mcp serve` (STDIO MCP) via the Claude Agent SDK, uses its assigned worktree as `cwd`, and commits all changes to its branch as the final step.
+
+### Storage
+
+| Location | Description |
+|----------|-------------|
+| `~/code/claude-storage` (host) | Local directory on your machine |
+| `/mnt/claude-output` (cluster) | Mounted into minikube via `minikube mount` |
+
+Each run creates:
+```
+~/code/claude-storage/
+  run-<id>/
+    repo/           <- main git repository
+    agent-0/        <- worktree on branch agent-0
+    agent-1/        <- worktree on branch agent-1
+    ...
+```
 
 ## Prerequisites
 
@@ -44,7 +78,7 @@ A Kubernetes-based multi-agent system that orchestrates multiple Claude Code MCP
 # 1. Set your Anthropic API key
 export ANTHROPIC_API_KEY=sk-ant-...
 
-# 2. Deploy everything
+# 2. Deploy everything (creates ~/code/claude-storage, starts minikube with mount)
 ./deploy.sh
 
 # 3. Access the UI
@@ -54,8 +88,12 @@ minikube service frontend -n frontend
 ## Manual Deployment
 
 ```bash
-# Start minikube
-minikube start --driver=docker --memory=4096 --cpus=2
+# Create the host storage directory
+mkdir -p ~/code/claude-storage
+
+# Start minikube with the host mount
+minikube start --driver=docker --memory=4096 --cpus=2 \
+  --mount --mount-string="$HOME/code/claude-storage:/mnt/claude-output"
 
 # Build images inside minikube's Docker
 eval $(minikube docker-env)
@@ -71,10 +109,8 @@ kubectl create secret generic anthropic-api-key \
   --namespace=backend \
   --from-literal=api-key=$ANTHROPIC_API_KEY
 
-# Deploy backend (RBAC, orchestrator, service)
+# Deploy storage, backend, and frontend
 kubectl apply -f k8s/backend/
-
-# Deploy frontend
 kubectl apply -f k8s/frontend/
 
 # Access the UI
@@ -93,7 +129,7 @@ minikube service frontend -n frontend
 │       └── index.html          # Web UI
 ├── backend/
 │   ├── orchestrator/
-│   │   ├── app.py              # FastAPI orchestrator
+│   │   ├── app.py              # FastAPI orchestrator (git + K8s Jobs)
 │   │   ├── Dockerfile
 │   │   └── requirements.txt
 │   └── mcp-worker/
@@ -109,7 +145,8 @@ minikube service frontend -n frontend
 │   └── backend/
 │       ├── orchestrator-deployment.yaml
 │       ├── orchestrator-service.yaml
-│       └── orchestrator-rbac.yaml
+│       ├── orchestrator-rbac.yaml
+│       └── storage.yaml        # PV + PVC for shared output
 ├── deploy.sh                   # One-command deployment script
 └── README.md
 ```
@@ -118,12 +155,35 @@ minikube service frontend -n frontend
 
 1. User enters a prompt and selects the number of agents in the web UI
 2. The frontend sends a POST request to the orchestrator
-3. The orchestrator creates one Kubernetes Job per agent in the `backend` namespace
-4. Each Job pod runs the MCP worker which:
+3. The orchestrator:
+   a. Creates `/mnt/claude-output/run-<id>/repo/` and runs `git init`
+   b. Makes an initial commit
+   c. For each agent, runs `git worktree add -b agent-N` to create a worktree and branch
+4. The orchestrator creates one Kubernetes Job per agent, passing:
+   - `AGENT_WORKTREE_PATH` -- the worktree directory as the agent's working directory
+   - `AGENT_BRANCH` -- the branch name for the agent
+5. Each Job pod runs the MCP worker which:
    - Uses the Claude Agent SDK (`query()`) with `claude mcp serve` as a STDIO MCP server
-   - Processes the prompt with `bypassPermissions` for autonomous operation
-   - Outputs results to stdout (collected via pod logs)
-5. The frontend polls the orchestrator for job status and displays results
+   - Receives system-prompt instructions to `git add -A && git commit` as the final step
+   - Works in its own worktree so agents never conflict
+6. After all agents finish, each agent's work is on a separate branch visible at `~/code/claude-storage/run-<id>/`
+
+## Inspecting Results
+
+```bash
+# List all runs
+ls ~/code/claude-storage/
+
+# See branches for a run
+cd ~/code/claude-storage/run-<id>/repo
+git branch
+
+# View agent-0's diff
+git diff main..agent-0
+
+# View agent-1's log
+git log agent-1 --oneline
+```
 
 ## Monitoring
 
@@ -157,3 +217,4 @@ kubectl logs -n backend job/mcp-worker-<group-id>-<agent-id>
 - MCP workers use `bypassPermissions` within the container sandbox -- the container itself is the security boundary
 - The Anthropic API key is stored as a Kubernetes Secret and injected via env vars
 - MCP worker pods are ephemeral (Jobs with `ttlSecondsAfterFinished: 3600`)
+- Shared storage uses a hostPath PV scoped to `~/code/claude-storage`

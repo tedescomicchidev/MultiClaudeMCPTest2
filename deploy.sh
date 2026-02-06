@@ -6,8 +6,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# Host directory that will be mounted into the minikube VM and exposed
+# as /mnt/claude-output inside every pod via a hostPath PV.
+HOST_STORAGE_DIR="${HOME}/code/claude-storage"
+
 # --- Helpers ---
 info()  { echo "[INFO]  $*"; }
+warn()  { echo "[WARN]  $*"; }
 error() { echo "[ERROR] $*" >&2; exit 1; }
 
 # --- Pre-flight checks ---
@@ -21,28 +26,57 @@ check_prerequisites() {
     info "All prerequisites met."
 }
 
+# --- Ensure the host storage directory exists ---
+ensure_host_storage() {
+    if [ ! -d "$HOST_STORAGE_DIR" ]; then
+        info "Creating host storage directory: $HOST_STORAGE_DIR"
+        mkdir -p "$HOST_STORAGE_DIR"
+    else
+        info "Host storage directory exists: $HOST_STORAGE_DIR"
+    fi
+}
+
 # --- Start minikube if not running ---
 ensure_minikube() {
     if minikube status --format='{{.Host}}' 2>/dev/null | grep -q "Running"; then
         info "minikube is already running."
     else
-        info "Starting minikube..."
+        info "Starting minikube with host mount..."
         local os_type
         os_type="$(uname -s)"
         case "$os_type" in
-            Linux)
-                # WSL2/Ubuntu - use docker driver
-                minikube start --driver=docker --memory=4096 --cpus=2
-                ;;
-            Darwin)
-                # macOS - use docker driver (works with Docker Desktop)
-                minikube start --driver=docker --memory=4096 --cpus=2
+            Linux|Darwin)
+                minikube start --driver=docker --memory=4096 --cpus=2 \
+                    --mount --mount-string="${HOST_STORAGE_DIR}:/mnt/claude-output"
                 ;;
             *)
                 error "Unsupported OS: $os_type"
                 ;;
         esac
-        info "minikube started."
+        info "minikube started with mount ${HOST_STORAGE_DIR} -> /mnt/claude-output."
+    fi
+}
+
+# --- Ensure the mount is active (even if minikube was already running) ---
+ensure_mount() {
+    # Check whether the mount is already active by looking for a running
+    # `minikube mount` process with our mount string.
+    if pgrep -f "minikube mount.*${HOST_STORAGE_DIR}:/mnt/claude-output" >/dev/null 2>&1; then
+        info "minikube mount already active."
+        return
+    fi
+
+    # If minikube was started *without* --mount, start a background mount.
+    info "Starting background minikube mount: ${HOST_STORAGE_DIR} -> /mnt/claude-output"
+    nohup minikube mount "${HOST_STORAGE_DIR}:/mnt/claude-output" \
+        > /tmp/minikube-mount.log 2>&1 &
+    MOUNT_PID=$!
+    sleep 2
+
+    if kill -0 "$MOUNT_PID" 2>/dev/null; then
+        info "minikube mount running (PID $MOUNT_PID). Log: /tmp/minikube-mount.log"
+    else
+        warn "minikube mount may have failed. Check /tmp/minikube-mount.log"
     fi
 }
 
@@ -99,6 +133,10 @@ apply_manifests() {
     info "Applying Kubernetes manifests..."
 
     kubectl apply -f "$SCRIPT_DIR/k8s/namespaces.yaml"
+
+    # Storage (PV + PVC) must exist before deployments reference the PVC
+    kubectl apply -f "$SCRIPT_DIR/k8s/backend/storage.yaml"
+
     kubectl apply -f "$SCRIPT_DIR/k8s/backend/orchestrator-rbac.yaml"
     kubectl apply -f "$SCRIPT_DIR/k8s/backend/orchestrator-deployment.yaml"
     kubectl apply -f "$SCRIPT_DIR/k8s/backend/orchestrator-service.yaml"
@@ -133,6 +171,13 @@ print_access_info() {
     fi
 
     echo ""
+    echo "  Host storage: $HOST_STORAGE_DIR"
+    echo "  Cluster path: /mnt/claude-output"
+    echo ""
+    echo "  Each run creates:"
+    echo "    $HOST_STORAGE_DIR/run-<id>/repo/     <- main git repo"
+    echo "    $HOST_STORAGE_DIR/run-<id>/agent-N/  <- worktree per agent"
+    echo ""
     echo "  Useful commands:"
     echo "    kubectl get pods -n frontend"
     echo "    kubectl get pods -n backend"
@@ -146,7 +191,9 @@ print_access_info() {
 main() {
     info "Deploying Multi-Agent Claude MCP to minikube..."
     check_prerequisites
+    ensure_host_storage
     ensure_minikube
+    ensure_mount
     build_images
     create_secret
     apply_manifests
