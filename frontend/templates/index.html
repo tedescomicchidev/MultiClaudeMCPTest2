@@ -189,6 +189,7 @@
     <script>
         let currentGroupId = null;
         let pollInterval = null;
+        let visibleLogs = new Set();
 
         async function runAgents() {
             const prompt = document.getElementById('prompt').value.trim();
@@ -268,7 +269,7 @@
                     </div>
                     ${job.start_time ? `<div style="font-size:0.75rem;color:#707080;">Started: ${job.start_time}</div>` : ''}
                     ${job.completion_time ? `<div style="font-size:0.75rem;color:#707080;">Completed: ${job.completion_time}</div>` : ''}
-                    <div class="job-log" id="log-${job.name}">Loading logs...</div>
+                    <div class="job-log${visibleLogs.has(job.name) ? ' visible' : ''}" id="log-${job.name}">Loading logs...</div>
                 </div>
             `).join('');
         }
@@ -277,9 +278,11 @@
             const logDiv = document.getElementById(`log-${jobName}`);
             if (logDiv.classList.contains('visible')) {
                 logDiv.classList.remove('visible');
+                visibleLogs.delete(jobName);
                 return;
             }
             logDiv.classList.add('visible');
+            visibleLogs.add(jobName);
             logDiv.textContent = 'Loading logs...';
             try {
                 const resp = await fetch(`/api/results/${jobName}`);
