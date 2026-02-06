@@ -39,6 +39,16 @@ class RunRequest(BaseModel):
     num_agents: int = 1
 
 
+class SpawnWorkerRequest(BaseModel):
+    """Request to spawn a reviewer or committer worker."""
+    group_id: str
+    agent_id: int
+    branch: str
+    worktree_path: str
+    agent_type: str  # "reviewer" or "committer"
+    prompt: str = ""  # Optional custom prompt
+
+
 # ---------------------------------------------------------------------------
 # Git helpers
 # ---------------------------------------------------------------------------
@@ -75,6 +85,8 @@ def setup_run_repo(group_id: str, num_agents: int) -> list[dict]:
     _run_git(["init"], cwd=repo_dir)
     _run_git(["config", "user.email", "agent@claude.local"], cwd=repo_dir)
     _run_git(["config", "user.name", "Claude Agent"], cwd=repo_dir)
+    _run_git(["config", "init.defaultBranch", "main"], cwd=repo_dir)
+    _run_git(["branch", "-m", "main"], cwd=repo_dir)  # Rename current branch to main
 
     # 2. Create an initial commit so branches can be created
     readme_path = os.path.join(repo_dir, "README.md")
@@ -210,6 +222,57 @@ async def healthz():
     return {"status": "ok"}
 
 
+@app.post("/api/spawn-worker")
+async def spawn_worker(req: SpawnWorkerRequest):
+    """Spawn a reviewer or committer worker.
+
+    This endpoint is called by hooks in the mcp-worker to trigger
+    the next stage of the workflow:
+    - After a worker commits: spawn a reviewer
+    - After a reviewer commits (with review-details.md): spawn a committer
+    """
+    if req.agent_type not in ("reviewer", "committer"):
+        raise HTTPException(
+            status_code=400,
+            detail="agent_type must be 'reviewer' or 'committer'"
+        )
+
+    # Generate a unique job name based on the agent type
+    job_name = f"mcp-{req.agent_type}-{req.group_id}-{req.agent_id}"
+
+    logger.info(
+        "Spawning %s worker: job=%s, branch=%s, worktree=%s",
+        req.agent_type, job_name, req.branch, req.worktree_path
+    )
+
+    job = _build_job(
+        name=job_name,
+        prompt=req.prompt,
+        agent_id=req.agent_id,
+        group_id=req.group_id,
+        branch=req.branch,
+        worktree_path=req.worktree_path,
+        agent_type=req.agent_type,
+    )
+
+    try:
+        batch_v1.create_namespaced_job(namespace=NAMESPACE, body=job)
+    except client.exceptions.ApiException as e:
+        logger.error("Failed to create job %s: %s", job_name, e)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to create job: {e.reason}"
+        )
+
+    return {
+        "status": "spawned",
+        "job_name": job_name,
+        "agent_type": req.agent_type,
+        "group_id": req.group_id,
+        "branch": req.branch,
+    }
+
+
 # ---------------------------------------------------------------------------
 # K8s Job builder
 # ---------------------------------------------------------------------------
@@ -221,12 +284,16 @@ def _build_job(
     group_id: str,
     branch: str,
     worktree_path: str,
+    agent_type: str = "worker",
 ) -> client.V1Job:
     """Build a K8s Job spec for an MCP worker.
 
     The worker receives the worktree path and branch via env vars so it can:
     - use the worktree as its working directory
     - commit all changes to the assigned branch when done
+
+    Args:
+        agent_type: One of "worker", "reviewer", or "committer"
     """
     container = client.V1Container(
         name="mcp-worker",
@@ -238,6 +305,7 @@ def _build_job(
             client.V1EnvVar(name="JOB_GROUP_ID", value=group_id),
             client.V1EnvVar(name="AGENT_BRANCH", value=branch),
             client.V1EnvVar(name="AGENT_WORKTREE_PATH", value=worktree_path),
+            client.V1EnvVar(name="AGENT_TYPE", value=agent_type),
             client.V1EnvVar(
                 name="ANTHROPIC_API_KEY",
                 value_from=client.V1EnvVarSource(

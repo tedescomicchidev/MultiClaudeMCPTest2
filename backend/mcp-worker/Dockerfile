@@ -8,12 +8,13 @@
 
 FROM node:20-slim
 
-# Install Python and essential tools
+# Install Python and essential tools (including curl and jq for hooks)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
     python3-venv \
     git \
+    curl \
     jq \
     && rm -rf /var/lib/apt/lists/*
 
@@ -24,9 +25,7 @@ RUN npm install -g @anthropic-ai/claude-code
 RUN useradd -m -s /bin/bash agent && \
     mkdir -p /home/agent/workspace && \
     mkdir -p /home/agent/.claude && \
-    mkdir -p /app && \
-    chown -R agent:agent /home/agent && \
-    chown -R agent:agent /app
+    chown -R agent:agent /home/agent
 
 USER agent
 WORKDIR /home/agent/workspace
@@ -39,10 +38,10 @@ COPY --chown=agent:agent requirements.txt /home/agent/
 RUN pip install --no-cache-dir -r /home/agent/requirements.txt
 
 # Copy the worker script to /app for consistent path references in hooks
-COPY --chown=agent:agent worker.py /app/worker.py
 COPY --chown=agent:agent worker.py /home/agent/
 
-# Copy Claude Code hooks configuration
-COPY --chown=agent:agent .claude/ /home/agent/.claude/
+# Copy Claude Code configuration and hooks
+COPY --chown=agent:agent .claude /home/agent/.claude/
+RUN chmod +x /home/agent/.claude/hooks/*.sh
 
 CMD ["python3", "/home/agent/worker.py"]
